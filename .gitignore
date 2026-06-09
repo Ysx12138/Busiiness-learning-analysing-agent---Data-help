@@ -1,0 +1,35 @@
+# DataHelp 运行时数据
+.datahelp/
+
+# 原始数据集（太大，不纳入版本控制）
+data/
+
+# 环境变量
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Node.js（build_learning_doc 等辅助工具）
+node_modules/
+
+# 生成的文件
+*.docx
+output/
+output_skill/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

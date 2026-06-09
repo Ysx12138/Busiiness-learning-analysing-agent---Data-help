@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datahelp"
+version = "0.2.0"
+description = "DataHelp —— 商科生的数据分析学习 Agent"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "DataHelp Contributors" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Education",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Education",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "fpdf2>=2.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Ysx12138/Busiiness-learning-analysing-agent---Data-help"
+Source = "https://github.com/Ysx12138/Busiiness-learning-analysing-agent---Data-help"
+Documentation = "https://github.com/Ysx12138/Busiiness-learning-analysing-agent---Data-help#readme"
+
+[project.scripts]
+datahelp = "datahelp.cli:main"
+
+[tool.setuptools]
+packages = ["datahelp"]

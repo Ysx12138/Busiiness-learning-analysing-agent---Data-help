@@ -1,0 +1,4 @@
+{"id": "list_root", "prompt": "列出项目根目录的文件"}
+{"id": "read_readme", "prompt": "读取 README.md"}
+{"id": "check_pyproject", "prompt": "查看 pyproject.toml"}
+{"id": "project_structure", "prompt": "这个项目有哪些 Python 文件？"}
