@@ -1,4 +1,5 @@
 """命令行入口 —— 支持 one-shot 和 REPL 模式。"""
+from __future__ import annotations
 
 import argparse
 import os
@@ -32,6 +33,55 @@ def build_agent(args) -> tuple[DataHelp, RunStore]:
     return agent, run_store
 
 
+def _skill_step0_confirm(args, agent: DataHelp) -> tuple[str, str, str]:
+    """Step 0: 交互确认数据集、输出模式、输出文件夹。
+
+    仅在 --mode 指定时执行。
+    返回 (task, mode, output_dir)，其中 task 可能被修改。
+    """
+    mode = agent._mode or "beginner_summary"
+    output_dir = agent._output_dir or ""
+    task = args.task or ""
+
+    print("\n  ╭─ Step 0: 分析前确认 ───────────────────")
+    print("  │ 请确认以下三项信息：")
+
+    # 0a: 确认数据集
+    default_dataset = ""
+    if task:
+        import re
+        path_match = re.search(r"data/[^\s,，。]+\.csv", task)
+        if path_match:
+            default_dataset = path_match.group()
+    dataset_prompt = f"  数据集路径 [{default_dataset or '未指定'}]: "
+    dataset_input = input(dataset_prompt).strip()
+    if dataset_input:
+        task = f"分析 {dataset_input} 的数据"
+
+    # 0b: 确认输出模式
+    mode_prompt = f"  输出模式 [{mode}] (beginner_summary / standard_report / audit_report): "
+    mode_input = input(mode_prompt).strip()
+    if mode_input and mode_input in ("beginner_summary", "standard_report", "audit_report"):
+        mode = mode_input
+
+    # 0c: 确认输出文件夹
+    out_prompt = f"  输出文件夹 [{output_dir or '默认（不生成交付物）'}]: "
+    out_input = input(out_prompt).strip()
+    if out_input:
+        output_dir = out_input
+
+    # 更新 agent
+    agent._mode = mode
+    agent._output_dir = output_dir if output_dir else None
+    if agent.skill_engine:
+        from datahelp.skill_engine import create_skill_engine
+        agent.skill_engine = create_skill_engine(mode)
+
+    print(f"  │ 模式: {mode}  |  输出: {output_dir or '无'}")
+    print("  ╰────────────────────────────────────────\n")
+    return task, mode, output_dir
+
+
 def run_one_shot(agent: DataHelp, run_store: RunStore, task: str, output_dir: str | None = None):
     print(f"\n  datahelp: {task}")
     print(f"  模型: {agent.model.model_name}")
@@ -56,12 +106,13 @@ def run_one_shot(agent: DataHelp, run_store: RunStore, task: str, output_dir: st
         repo_path = Path(agent.repo_root)
         csv_files = list(repo_path.glob("*.csv"))
         if csv_files:
+            mode = agent.skill_engine.config.mode if agent.skill_engine else ""
             from datahelp.tools_data import generate_excel, generate_html, generate_pdf
             for csv_file in csv_files:
                 try:
-                    print(generate_excel(str(csv_file), agent.repo_root, str(output_path), analysis_text=analysis_text))
+                    print(generate_excel(str(csv_file), agent.repo_root, str(output_path), analysis_text=analysis_text, mode=mode))
                     print(generate_html(str(csv_file), agent.repo_root, str(output_path), analysis_text=analysis_text))
-                    print(generate_pdf(str(csv_file), agent.repo_root, str(output_path), analysis_text=analysis_text))
+                    print(generate_pdf(str(csv_file), agent.repo_root, str(output_path), analysis_text=analysis_text, mode=mode))
                 except Exception as e:
                     print(f"  ⚠️  {csv_file.name} 交付物生成失败: {e}")
         else:
@@ -153,7 +204,12 @@ def main():
 
     agent, run_store = build_agent(args)
     if args.task:
-        result = run_one_shot(agent, run_store, args.task, output_dir=args.output_dir)
+        # Step 0: mode 指定时执行输入确认
+        task = args.task
+        output_dir = args.output_dir
+        if args.mode and not args.eval:
+            task, mode, output_dir = _skill_step0_confirm(args, agent)
+        result = run_one_shot(agent, run_store, task, output_dir=output_dir)
         print(result)
     else:
         run_repl(agent, run_store)

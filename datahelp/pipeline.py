@@ -1,11 +1,11 @@
-"""数据分析流水线 —— 统一分析入口，复用现有 agent 流程。
+"""数据分析流水线 —— 统一分析入口，复用现有 agent 流程。"""
+from __future__ import annotations
 
-提供 `run_data_help_analysis()` 函数，供：
-- 手动模式：用户选择文件后调用
-- watch 模式：监听器检测到新文件后调用
-
-不修改任何现有的 skill 输出逻辑。
-"""
+# 提供 `run_data_help_analysis()` 函数，供：
+# - 手动模式：用户选择文件后调用
+# - watch 模式：监听器检测到新文件后调用
+#
+# 不修改任何现有的 skill 输出逻辑。
 
 import json
 import os
@@ -212,6 +212,7 @@ def run_data_help_analysis(
                 self.provider = provider
                 self.model = model
                 self.cwd = str(work_dir)
+                self.output_dir = str(task_dir)
                 self.max_steps = max_steps
                 self.max_new_tokens = max_new_tokens
                 self.approval = "auto"
@@ -272,9 +273,9 @@ def run_data_help_analysis(
             from datahelp.tools_data import generate_excel, generate_html, generate_pdf
             csv_for_deliverable = work_csv if input_path.suffix.lower() != ".csv" else work_csv
             if csv_for_deliverable and Path(csv_for_deliverable).exists():
-                excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir))
-                html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir))
-                pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir))
+                excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
                 print(f"\n  {excel_result}")
                 print(f"  {html_result}")
                 print(f"  {pdf_result}")

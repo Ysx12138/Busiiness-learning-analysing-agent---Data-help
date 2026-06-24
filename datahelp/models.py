@@ -1,10 +1,37 @@
 """模型客户端抽象层 —— 统一不同 LLM 提供商的调用接口。"""
+from __future__ import annotations
 
 import json
-import urllib.request
 from abc import ABC, abstractmethod
 
+import httpx
+
 from datahelp.config import provider_env
+
+
+# ── 模块级共享 HTTP 客户端（连接复用） ─────────────────
+
+_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    """获取共享 httpx 客户端（首次调用时创建，后续复用 TCP 连接）。"""
+    global _client
+    if _client is None:
+        _client = httpx.Client(
+            proxy=None,             # 跳过系统代理（如 Clash），避免代理延迟
+            timeout=httpx.Timeout(120.0, connect=30.0),
+            follow_redirects=True,
+        )
+    return _client
+
+
+def _reset_client():
+    """重置 HTTP 客户端（释放旧连接，主要用于测试/重连）。"""
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
 
 
 class ModelClient(ABC):
@@ -113,16 +140,11 @@ class OpenAIModelClient(ModelClient):
         }
         if self._temperature is not None:
             payload["temperature"] = self._temperature
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._api_key}",
-            },
-            method="POST",
-        )
-        data = _do_request(req, self._base_url)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+        data = _do_request(url, headers, payload, self._base_url)
         choices = data.get("choices", [])
         if choices:
             return choices[0].get("message", {}).get("content", "")
@@ -155,45 +177,54 @@ class OllamaModelClient(ModelClient):
         }
         if self._temperature is not None:
             payload["options"]["temperature"] = self._temperature
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        data = _do_request(req, self._base_url)
+        headers = {"Content-Type": "application/json"}
+        data = _do_request(url, headers, payload, self._base_url)
         return data.get("response", str(data))
 
 
 # ── 共享工具函数 ────────────────────────────────────
 
-def _do_request(req: urllib.request.Request, base_url: str) -> dict:
-    """发送 HTTP 请求并解析 JSON 响应，网络错误时自动重试（指数退避）。"""
+def _do_request(
+    url: str,
+    headers: dict[str, str],
+    payload: dict,
+    base_url: str,
+    timeout: float = 120.0,
+) -> dict:
+    """发送 HTTP POST JSON 请求并解析响应，网络错误时自动重试（指数退避）。"""
     import time
-    max_retries = 3
+    client = _get_client()
+    max_retries = 2
     last_error = None
     for attempt in range(max_retries):
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            if e.code >= 500 and attempt < max_retries - 1:
-                last_error = f"HTTP {e.code}"
+            resp = client.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            error_body = e.response.text
+            if status >= 500 and attempt < max_retries - 1:
+                last_error = f"HTTP {status}"
                 time.sleep(0.5 * (2 ** attempt))
                 continue
-            raise RuntimeError(f"API 请求失败 (HTTP {e.code}): {error_body}")
-        except urllib.error.URLError as e:
+            raise RuntimeError(f"API 请求失败 (HTTP {status}): {error_body}")
+        except httpx.RequestError as e:
             if attempt < max_retries - 1:
-                last_error = str(e.reason)
+                last_error = str(e)
                 time.sleep(0.5 * (2 ** attempt))
                 continue
-            raise RuntimeError(f"无法连接到 API ({base_url}): {e.reason}")
+            if isinstance(e, httpx.ConnectError):
+                raise RuntimeError(f"无法连接到 API ({base_url}): {e}")
+            if isinstance(e, httpx.TimeoutException):
+                raise RuntimeError(f"API 请求超时 ({base_url}): {e}")
+            raise RuntimeError(f"API 请求失败 ({base_url}): {e}")
     raise RuntimeError(f"API 请求在 {max_retries} 次重试后失败: {last_error}")
 
 
 def _call_anthropic_messages(base_url: str, model: str, api_key: str, prompt: str, max_tokens: int, temperature: float | None = None) -> str:
     """调用 Anthropic Messages API 格式（DeepSeek 兼容接口也用这个格式）。"""
+    url = f"{base_url.rstrip('/')}/messages"
     payload = {
         "model": model,
         "max_tokens": max_tokens,
@@ -201,18 +232,12 @@ def _call_anthropic_messages(base_url: str, model: str, api_key: str, prompt: st
     }
     if temperature is not None:
         payload["temperature"] = temperature
-    url = f"{base_url.rstrip('/')}/messages"
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-    data = _do_request(req, base_url)
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    data = _do_request(url, headers, payload, base_url)
     content = data.get("content", [])
     if content and isinstance(content, list):
         for block in content:

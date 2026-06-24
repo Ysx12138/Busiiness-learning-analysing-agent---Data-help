@@ -1,4 +1,5 @@
 """分层的会话记忆 —— task_summary, recent_files, file_summaries, episodic_notes, durable。"""
+from __future__ import annotations
 
 import re
 import time

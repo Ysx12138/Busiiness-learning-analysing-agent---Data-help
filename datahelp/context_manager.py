@@ -1,4 +1,5 @@
 """分层 prompt 组装与预算控制。"""
+from __future__ import annotations
 
 import textwrap
 from dataclasses import dataclass, field

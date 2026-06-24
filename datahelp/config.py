@@ -1,4 +1,5 @@
 """配置管理 —— 加载 .env 文件，统一管理环境变量。"""
+from __future__ import annotations
 
 import os
 import re
