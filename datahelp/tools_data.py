@@ -194,15 +194,17 @@ def _extract_top_findings(text: str, max_count: int = 3) -> list[str]:
 
 
 def _clean_markdown(text: str) -> str:
-    """去除 Markdown 标记：#、**、-，保留序号与可读文本。"""
+    """去除 Markdown 标记：#、**、-、>，替换 ⚠ 为“注意：”，移除 U+FE0F。"""
     if not text:
         return ""
+    text = text.replace("⚠", "注意：").replace("️", "")
     lines = text.split("\n")
     cleaned = []
     for line in lines:
         line = re.sub(r'^#{1,6}\s+', '', line)
         line = line.replace('**', '')
         line = re.sub(r'^[-*]\s+', '', line)
+        line = re.sub(r'^>\s+', '', line)
         if re.match(r'^\|\s*[-:| ]+\s*\|$', line):
             continue
         line = line.strip()
@@ -943,8 +945,27 @@ def generate_pdf(path: str, repo_root: str, output_dir: str = "", analysis_text:
     total_cols = len(headers)
 
     # 解析报告章节
+    analysis_text = analysis_text.replace("⚠", "注意：").replace("️", "")
     report_sections = _parse_report_sections(analysis_text)
     structured_summary = _extract_structured_summary(analysis_text) if analysis_text else {}
+
+    # 同步清理 structured_summary 中可能含 ⚠ 和 markdown blockquote 前缀的文本
+    def _strip_blockquote(text: str) -> str:
+        """清除每行的 '> ' 块引用前缀。"""
+        return "\n".join(
+            line[2:] if line.startswith("> ") else line
+            for line in text.split("\n")
+        )
+
+    if structured_summary.get("summary"):
+        text = structured_summary["summary"].replace("⚠", "注意：")
+        structured_summary["summary"] = _strip_blockquote(text)
+    for i, f in enumerate(structured_summary.get("findings", [])):
+        text = f.replace("⚠", "注意：")
+        structured_summary["findings"][i] = _strip_blockquote(text)
+    if structured_summary.get("recommendations"):
+        text = structured_summary["recommendations"].replace("⚠", "注意：")
+        structured_summary["recommendations"] = _strip_blockquote(text)
 
     pdf = FPDF()
     pdf.add_page()
@@ -1107,6 +1128,11 @@ def generate_pdf(path: str, repo_root: str, output_dir: str = "", analysis_text:
                 pdf.set_font(cjk_family, "", 10)
             elif stripped.startswith("|"):
                 continue
+            elif stripped.startswith("> "):
+                cleaned = _clean_markdown(stripped[2:].strip())
+                if cleaned:
+                    pdf.set_x(pdf.l_margin)
+                    pdf.multi_cell(pdf.epw, 5, cleaned, new_x="LMARGIN")
             else:
                 cleaned = _clean_markdown(stripped)
                 if cleaned:
