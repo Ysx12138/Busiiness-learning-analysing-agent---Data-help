@@ -1,11 +1,14 @@
-"""数据分析流水线 —— 统一分析入口，复用现有 agent 流程。
+"""数据分析流水线 —— 统一分析入口，复用现有 agent 流程。"""
+from __future__ import annotations
 
-提供 `run_data_help_analysis()` 函数，供：
-- 手动模式：用户选择文件后调用
-- watch 模式：监听器检测到新文件后调用
-
-不修改任何现有的 skill 输出逻辑。
-"""
+# 提供 `run_data_help_analysis()` 函数，供：
+# - 手动模式：用户选择文件后调用
+# - watch 模式：监听器检测到新文件后调用
+#
+# 不修改任何现有的 skill 输出逻辑。
+#
+# V2 确定性分析引擎：pipeline 默认优先运行，生成可审计的结构化证据；
+# 仅在引擎抛出异常时回退到 legacy agent 流程。
 
 import json
 import os
@@ -201,36 +204,88 @@ def run_data_help_analysis(
 
         result["working_file"] = work_csv
 
+        # ── 确定性分析引擎：产生可审计证据文件 ──
+        engine_result = None
+        try:
+            from datahelp.analysis_engine import DeterministicAnalysisEngine
+
+            engine_result = DeterministicAnalysisEngine.run(work_csv, str(task_dir))
+            result["evidence_status"] = "success"
+            evidence_files = ["analysis_evidence.json", "analysis_evidence.md"]
+            result["evidence_files"] = evidence_files
+            result["evidence_error"] = ""
+
+            for fname in evidence_files:
+                fpath = task_dir / fname
+                if fpath.exists() and fname not in result["generated_files"]:
+                    result["generated_files"].append(fname)
+
+            print(f"  ✅ 证据文件已生成: {', '.join(evidence_files)}")
+        except Exception as e:
+            result["evidence_status"] = "failed"
+            result["evidence_files"] = []
+            result["evidence_error"] = str(e)
+            print(f"  ⚠️ 确定性分析引擎异常（不影响主流程）: {e}")
+
         # ── 加载环境变量 ──
         load_project_env(str(work_dir))
 
-        # ── 构建 agent（复用 cli.py 的 build_agent 流程） ──
-        from datahelp.cli import build_agent
+        # ── 分支：确定性分析路径 vs 传统 agent 路径 ──
+        if result.get("evidence_status") == "success":
+            # 确定性分析 + 报告编排路径（无 agent）
+            from datahelp.report_orchestrator import ReportOrchestrator
 
-        class _Args:
-            def __init__(self):
-                self.provider = provider
-                self.model = model
-                self.cwd = str(work_dir)
-                self.max_steps = max_steps
-                self.max_new_tokens = max_new_tokens
-                self.approval = "auto"
-                self.temperature = None
-                self.mode = mode
-                self.eval = None  # eval 模式不需要在 pipeline 支持
+            try:
+                client = create_model_client(provider=provider, model=model)
+                outcome = ReportOrchestrator(client, engine_result, mode).run()
+                final_answer = outcome.text
+                result["report_quality"] = {
+                    "status": outcome.quality_status,
+                    "attempts": outcome.attempts,
+                    "warnings": outcome.warnings,
+                }
+                agent = None
+                _model_name = client.model_name
+            except Exception as e:
+                from datahelp.report_orchestrator import build_evidence_report
+                final_answer = build_evidence_report(engine_result)
+                result["report_quality"] = {
+                    "status": "degraded",
+                    "attempts": 0,
+                    "warnings": [f"LLM 报告编排异常: {e}"],
+                }
+                agent = None
+                _model_name = "degraded"
+        else:
+            # ── 传统 agent 路径（完全原有流程） ──
+            from datahelp.cli import build_agent
 
-        args = _Args()
-        agent, run_store = build_agent(args)
+            class _Args:
+                def __init__(self):
+                    self.provider = provider
+                    self.model = model
+                    self.cwd = str(work_dir)
+                    self.output_dir = str(task_dir)
+                    self.max_steps = max_steps
+                    self.max_new_tokens = max_new_tokens
+                    self.approval = "auto"
+                    self.temperature = None
+                    self.mode = mode
+                    self.eval = None  # eval 模式不需要在 pipeline 支持
 
-        # ── 执行分析 ──
-        user_message = f"分析数据集 {Path(work_csv).name}"
-        print(f"\n  📊 开始分析: {Path(input_file).name}")
-        print(f"  📁 工作目录: {work_dir}")
-        print(f"  🤖 模型: {agent.model.model_name}\n")
+            args = _Args()
+            agent, run_store = build_agent(args)
 
-        final_answer = agent.ask(user_message)
+            # ── 执行分析 ──
+            user_message = f"分析数据集 {Path(work_csv).name}"
+            print(f"\n  📊 开始分析: {Path(input_file).name}")
+            print(f"  📁 工作目录: {work_dir}")
+            print(f"  🤖 模型: {agent.model.model_name}\n")
 
-        # ── 保存 agent 输出 ──
+            final_answer = agent.ask(user_message)
+            _model_name = agent.model.model_name
+
+        # ── 保存报告（共用 final_answer） ──
         report_path = task_dir / "analysis_report.md"
         report_content = f"""# 数据分析报告
 
@@ -238,7 +293,7 @@ def run_data_help_analysis(
 
 - **数据集**: {input_path.name}
 - **分析时间**: {now_iso()}
-- **模型**: {agent.model.model_name}
+- **模型**: {_model_name}
 - **模式**: {mode}
 
 ---
@@ -250,8 +305,8 @@ def run_data_help_analysis(
         report_path.write_text(report_content, encoding="utf-8")
         result["generated_files"].append("analysis_report.md")
 
-        # ── 保存 task_state ──
-        if agent.task_state:
+        # ── 保存 task_state（仅 agent 路径） ──
+        if agent is not None and agent.task_state:
             ts_path = task_dir / "task_state.json"
             ts_path.write_text(
                 json.dumps(agent.task_state.to_dict(), indent=2, ensure_ascii=False),
@@ -259,22 +314,23 @@ def run_data_help_analysis(
             )
             result["generated_files"].append("task_state.json")
 
-        # ── 保存 history ──
-        history_path = task_dir / "history.json"
-        history_path.write_text(
-            json.dumps(agent.history, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        result["generated_files"].append("history.json")
+        # ── 保存 history（仅 agent 路径） ──
+        if agent is not None:
+            history_path = task_dir / "history.json"
+            history_path.write_text(
+                json.dumps(agent.history, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result["generated_files"].append("history.json")
 
         # ── 生成交付物（Excel / HTML / PDF）──
         try:
             from datahelp.tools_data import generate_excel, generate_html, generate_pdf
             csv_for_deliverable = work_csv if input_path.suffix.lower() != ".csv" else work_csv
             if csv_for_deliverable and Path(csv_for_deliverable).exists():
-                excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir))
-                html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir))
-                pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir))
+                excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
                 print(f"\n  {excel_result}")
                 print(f"  {html_result}")
                 print(f"  {pdf_result}")

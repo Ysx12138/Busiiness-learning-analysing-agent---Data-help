@@ -1,8 +1,12 @@
 """工具注册表与安全校验 —— 定义 agent 可执行的所有动作。"""
+from __future__ import annotations
 
 import fnmatch
 import os
+import re
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from datahelp.workspace import IGNORED_PATH_NAMES
@@ -196,6 +200,8 @@ def tool_run_shell(args: dict, repo_root: str) -> str:
         "USER": os.environ.get("USER", ""),
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
     }
+    # 将命令开头的 python/python3 替换为 sys.executable（允许前置空白）
+    command = re.sub(r"(^\s*|(?:&&|;)\s*)python(?:3)?\s+", lambda m: f"{m.group(1)}{shlex.quote(sys.executable)} ", command, count=1)
     try:
         result = subprocess.run(
             command,
@@ -210,7 +216,7 @@ def tool_run_shell(args: dict, repo_root: str) -> str:
         return f"错误: 命令执行超时 ({timeout} 秒)"
     except Exception as e:
         return f"错误: 命令执行失败 - {e}"
-    output_parts = []
+    output_parts = [f"执行命令: {command}"]
     if result.stdout:
         output_parts.append(result.stdout.strip()[:3000])
     if result.stderr:
@@ -297,22 +303,22 @@ def build_tool_registry(repo_root: str, depth: int = 0, max_depth: int = 1) -> d
             run_fn=lambda args: read_csv_summary(args["path"], repo_root),
         ),
         "generate_excel": _make_tool_spec(
-            schema={"path": "str", "output_dir": "str="},
+            schema={"path": "str", "output_dir": "str=", "analysis_text": "str=", "mode": "str="},
             risky=False,
             description="生成数据分析 Excel 交付物（含数据表、统计表、图表、看板）",
-            run_fn=lambda args: generate_excel(args["path"], repo_root, args.get("output_dir", "")),
+            run_fn=lambda args: generate_excel(args["path"], repo_root, args.get("output_dir", ""), args.get("analysis_text", ""), args.get("mode", "")),
         ),
         "generate_html": _make_tool_spec(
-            schema={"path": "str", "output_dir": "str="},
+            schema={"path": "str", "output_dir": "str=", "analysis_text": "str=", "mode": "str="},
             risky=False,
             description="生成数据分析 HTML 报告",
-            run_fn=lambda args: generate_html(args["path"], repo_root, args.get("output_dir", "")),
+            run_fn=lambda args: generate_html(args["path"], repo_root, args.get("output_dir", ""), args.get("analysis_text", "")),
         ),
         "generate_pdf": _make_tool_spec(
-            schema={"path": "str", "output_dir": "str="},
+            schema={"path": "str", "output_dir": "str=", "analysis_text": "str=", "mode": "str="},
             risky=False,
             description="生成数据分析 PDF 报告",
-            run_fn=lambda args: generate_pdf(args["path"], repo_root, args.get("output_dir", "")),
+            run_fn=lambda args: generate_pdf(args["path"], repo_root, args.get("output_dir", ""), args.get("analysis_text", "")),
         ),
     }
     if depth < max_depth:

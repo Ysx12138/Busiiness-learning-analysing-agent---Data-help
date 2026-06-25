@@ -1,4 +1,5 @@
 """WorkspaceContext —— agent 进入仓库后的工作区快照。"""
+from __future__ import annotations
 
 import hashlib
 import os

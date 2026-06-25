@@ -1,4 +1,5 @@
 """文件监听器 —— 监听 input_dir，自动触发数据分析。
+from __future__ import annotations
 
 工作流程：
   1. 检查 input_dir 是否有新文件

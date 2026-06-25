@@ -1,4 +1,5 @@
 """单次 agent 运行的状态快照。"""
+from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
