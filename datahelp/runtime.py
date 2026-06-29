@@ -149,6 +149,23 @@ def _parse_xml_args(body: str) -> dict:
 SYSTEM_PROMPT = textwrap.dedent("""\
     你是 DataHelp，一个面向商科初学者的数据分析教学 Agent。
 
+    ## 产品级 Agent 工作原则（优先级最高）
+
+    DataHelp 不是让模型自由编造分析过程的报告机器人。你必须像一个数据分析学习助教：
+    先理解数据和用户目标，再主动选择稳定工具执行，最后只基于证据生成报告。
+
+    首选工作流：
+
+    1. inspect_dataset — 先检查数据集、字段、样例值和基础风险
+    2. suggest_analysis_plan — 根据字段和用户目标生成分析计划
+    3. run_analysis_evidence — 生成可追溯的结构化分析证据
+    4. validate_evidence — 校验证据是否足以生成报告
+    5. compose_report_from_evidence 或 <final> — 只基于证据生成教学报告
+
+    除非高层工具无法满足任务，不要优先使用 write_file / run_shell。
+    如果使用 write_file / run_shell，必须说明为什么高层工具不足。
+    面向初学者的结果必须清楚说明：数据事实、业务解释、风险边界和下一步怎么做。
+
     ## 核心工作流程
 
     每次数据分析按以下步骤执行：
@@ -197,7 +214,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     **最多写 2 个分析脚本。analysis_02.py 执行完毕后必须立即输出 <final>，不得再写 analysis_03.py。**
 
     **Step 3 — 编译报告**
-    汇总所有分析脚本的输出，输出完整的 13 节 <final> 报告。
+    汇总所有分析证据，输出完整的 9 节 <final> 报告。
     教学规则和输出结构见下方 Business Analysis Skill（全文）。
 
     **Step 4 — 生成交付物**（如果配置了 output-dir）
@@ -252,35 +269,19 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
     ## 最终报告结构（必须遵守）
 
-    最终报告必须包含以下 13 个部分，缺一不可：
+    最终报告必须包含以下 9 个核心部分，缺一不可：
 
-    1. **数据概览** — 数据集规模、字段说明、外键识别
-    2. **字段识别与业务含义** — 每个字段的语义、字段-业务问题映射表
-    3. **数据质量检查** — 缺失值、重复值、异常值检查结论及教学说明
-    4. **基础指标分析** — 均值/中位数/标准差/分位数，含教学要点
-    5. **分组与排名分析** — 按类别/区域/卖家分组聚合、Top/Bottom 排名及集中度
-    6. **趋势分析** — 有日期字段时按月聚合，计算环比变化
-    7. **核心发现** — 每个发现含 8 要素教学（结果/方法/指标/公式/字段/业务/风险/复用）
-    8. **业务建议** — 数据驱动的具体行动建议
-    9. **进阶分析推荐** — 建议但不自动执行，说明为什么适合、需要什么字段、能回答什么
-    10. **跳过的高级方法及原因** — 透明说明哪些方法不执行、为什么
-    11. **分析边界与风险警告** — 当前分析的局限性和所有风险提示
-    12. **初学者教学总结** — 为什么这样分析、思维模型回顾、可复用的分析思路
-    13. **质量检查与改进建议** — 对本次分析的自行评估，包含：
+    1. **数据概览** — 数据集规模、字段说明、可分析方向
+    2. **数据质量检查** — 缺失值、重复值、异常值检查结论及教学说明
+    3. **基础指标分析** — 均值/中位数/标准差/分位数，含教学要点
+    4. **分组与排名分析** — 按类别/区域/卖家分组聚合、Top/Bottom 排名及集中度
+    5. **趋势分析** — 有日期字段时按月聚合；没有日期字段时说明无法执行的原因
+    6. **核心发现** — 每个发现含证据/方法/业务含义/风险/复用说明
+    7. **业务建议** — 数据驱动的具体行动建议
+    8. **分析边界与风险警告** — 当前分析的局限性、跳过方法及原因
+    9. **初学者教学总结** — 为什么这样分析、思维模型回顾、可复用的分析思路
 
-        **通过项**
-        - 字段解释完整度：关键字段是否说明含义、类型、可分析方向、风险
-        - 分析问题质量：问题是否被当前数据回答，是否避免空泛商业口号
-        - 报告可读性：初学者是否能看懂结论来源、指标含义、下一步验证
-        - 复盘可迁移性：是否留下方法、公式、适用条件、下次操作建议
-
-        **风险项**
-        - 列出所有因数据限制、样本量、缺失字段导致的结论风险
-
-        **建议修正**
-        - 针对风险项列出可操作改进建议
-
-    在完成 1-2 轮分析脚本后，立即用 <final> 输出完整的 13 节报告。注意：最多 2 轮，analysis_02.py 执行后不得再写新脚本。
+    在完成证据生成和校验后，立即用 <final> 输出完整的 9 节报告。
 """)
 
 
@@ -311,6 +312,8 @@ class DataHelp:
         self._phase: str = "explore"  # "explore" | "analyze" | "report"
         self._gate_block_count: int = 0  # 连续门控拦截计数（用于逐步放宽限制）
         self._report_validated: bool = False  # 是否已完成 1 轮报告校验修正
+        self._agent_product_state: str = "uploaded"
+        self._evidence_paths: dict[str, str] = {}
 
         # 前缀缓存
         self._cached_prefix: str | None = None
@@ -342,6 +345,8 @@ class DataHelp:
             "convergence_triggered": self._convergence_triggered,
             "phase": self._phase,
             "gate_block_count": self._gate_block_count,
+            "agent_product_state": self._agent_product_state,
+            "evidence_paths": self._evidence_paths,
         }
         Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
         Path(ckpt_path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -372,6 +377,8 @@ class DataHelp:
             self._convergence_triggered = checkpoint.get("convergence_triggered", False)
             self._phase = checkpoint.get("phase", "explore")
             self._gate_block_count = checkpoint.get("gate_block_count", 0)
+            self._agent_product_state = checkpoint.get("agent_product_state", "uploaded")
+            self._evidence_paths = dict(checkpoint.get("evidence_paths", {}))
             attempts = checkpoint["attempts"]
             tool_steps = checkpoint["tool_steps"]
         else:
@@ -381,6 +388,8 @@ class DataHelp:
             self._explored_csvs = set()
             self._phase = "explore"
             self._gate_block_count = 0
+            self._agent_product_state = "uploaded"
+            self._evidence_paths = {}
             attempts = 0
             tool_steps = 0
 
@@ -591,6 +600,13 @@ class DataHelp:
             parts.append(f"# Business Analysis Skill（全文）\n\n[配置] {mode_note} | {output_note}\n\n{self.skill_instructions}")
 
         parts.append(f"# 可用工具\n{describe_tools(self.tools)}")
+        parts.append(
+            "# 当前产品级任务状态\n"
+            f"- state: {self._agent_product_state}\n"
+            f"- evidence_paths: {json.dumps(self._evidence_paths, ensure_ascii=False)}\n"
+            "请优先沿 inspect_dataset → suggest_analysis_plan → run_analysis_evidence → "
+            "validate_evidence → compose_report_from_evidence/<final> 推进。"
+        )
         parts.append(workspace.text())
 
         if self.durable_memory:
@@ -609,7 +625,7 @@ class DataHelp:
                 "1. 用 write_file 写 analysis_01.py，涵盖 5+ 个分析维度\n"
                 "2. 用 run_shell 执行 analysis_01.py\n"
                 "3. 分析结果，决定是否需要写 analysis_02.py 做补充\n"
-                "4. 用 <final> 输出完整 13 节报告\n\n"
+                "4. 用 <final> 输出完整 9 节报告\n\n"
                 "禁止：重新读 CSV 文件、反复 csv_summary、list_files、search\n"
                 "如果数据字段足以做描述统计，就直接写脚本分析，不要继续探索。"
             )
@@ -651,6 +667,12 @@ class DataHelp:
             cmd = args.get("command", "") if isinstance(args, dict) else str(args)
             if any(script in cmd for script in self._analysis_scripts_run):
                 return "证据已齐全，请立即用 <final> 输出报告；不得再次运行脚本。"
+
+        # 产品级 Agent 状态机：高层工具必须按用户可理解的任务流推进
+        if name == "run_analysis_evidence" and self._agent_product_state == "uploaded" and not self._explored_csvs:
+            return "错误：请先调用 inspect_dataset 检查数据集，再生成分析证据。"
+        if name == "compose_report_from_evidence" and self._agent_product_state not in ("validated", "reported"):
+            return "错误：请先调用 validate_evidence 校验证据，再生成报告。"
 
         # 数据真实性门控
         if name in ("run_shell", "generate_excel", "generate_html", "generate_pdf") and not self._explored_csvs:
@@ -755,6 +777,8 @@ class DataHelp:
         result = clip(result)
         self._update_memory_after_tool(name, args, result)
 
+        self._update_product_state_after_tool(name, args, result)
+
         # csv_summary 成功后注册已探索路径
         if name == "csv_summary" and "错误" not in result:
             self._explored_csvs.add(args.get("path", ""))
@@ -804,6 +828,44 @@ class DataHelp:
             result = result[-(MAX_TOOL_OUTPUT - 200):]
 
         return result
+
+    def _update_product_state_after_tool(self, name: str, args: dict, result: str):
+        """Advance the consumer-facing Agent task state after high-level tools."""
+        if result.startswith("错误"):
+            return
+        parsed = None
+        if result.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(result)
+            except json.JSONDecodeError:
+                parsed = None
+
+        if name == "inspect_dataset" and parsed and parsed.get("status") == "ok":
+            self._agent_product_state = "inspected"
+            path = args.get("path", "")
+            if path:
+                self._explored_csvs.add(path)
+        elif name == "suggest_analysis_plan" and parsed and parsed.get("status") == "ok":
+            self._agent_product_state = "planned"
+        elif name == "run_analysis_evidence" and parsed:
+            if parsed.get("status") == "ok":
+                self._agent_product_state = "analyzed"
+            elif parsed.get("status") in ("failed", "empty"):
+                self._agent_product_state = "failed"
+            for key in ("evidence_path", "evidence_md_path"):
+                if parsed.get(key):
+                    self._evidence_paths[key] = parsed[key]
+        elif name == "validate_evidence" and parsed:
+            if parsed.get("can_report"):
+                self._agent_product_state = "validated"
+            elif parsed.get("status") == "failed":
+                self._agent_product_state = "failed"
+            else:
+                self._agent_product_state = "degraded"
+        elif name == "compose_report_from_evidence":
+            self._agent_product_state = "reported"
+
+        self._cached_prefix = None
 
     def _update_memory_after_tool(self, name: str, args: dict, result: str):
         path = args.get("path", "")

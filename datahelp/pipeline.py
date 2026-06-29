@@ -21,6 +21,7 @@ from pathlib import Path
 
 from datahelp.config import load_project_env
 from datahelp.models import create_model_client
+from datahelp.analysis_contract import AnalysisResult
 
 
 def now_iso() -> str:
@@ -38,6 +39,150 @@ def ensure_dir(path: str) -> Path:
     p = Path(path).resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _result_has_read_error(result: AnalysisResult) -> bool:
+    return any(ev.metric_name == "read_error" for ev in result.all_evidence())
+
+
+def _result_is_reportable(result: AnalysisResult) -> bool:
+    return result.row_count > 0 and result.column_count > 0 and not _result_has_read_error(result)
+
+
+def _build_result_manifest(result: dict, task_dir: Path) -> dict:
+    """Create a reader-facing artifact manifest for one analysis run."""
+    generated = []
+    for name in result.get("generated_files", []):
+        path = task_dir / name
+        generated.append({
+            "name": name,
+            "path": str(path),
+            "exists": path.exists(),
+            "size_bytes": path.stat().st_size if path.exists() else 0,
+            "role": _file_role(name),
+        })
+
+    recommended = []
+    for role in ("report", "html", "excel", "pdf", "evidence_md"):
+        match = next((f for f in generated if f["role"] == role and f["exists"]), None)
+        if match:
+            recommended.append(match)
+
+    warnings = _public_warnings_for_result(result)
+    if not warnings and result.get("evidence_error"):
+        warnings.append(result["evidence_error"])
+
+    return {
+        "title": "DataHelp analysis result",
+        "status": result.get("status", "unknown"),
+        "input_file": result.get("input_file", ""),
+        "output_dir": str(task_dir),
+        "agent_path": result.get("agent_path", ""),
+        "evidence_status": result.get("evidence_status", ""),
+        "report_quality": result.get("report_quality", {}),
+        "warnings": list(dict.fromkeys(warnings)),
+        "recommended_files": recommended,
+        "files": generated,
+        "next_steps": _next_steps_for_result(result, recommended),
+    }
+
+
+def _file_role(name: str) -> str:
+    if name == "analysis_report.md":
+        return "report"
+    if name == "analysis_evidence.md":
+        return "evidence_md"
+    if name == "analysis_evidence.json":
+        return "evidence_json"
+    if name.endswith("_report.html"):
+        return "html"
+    if name.endswith("_analysis.xlsx"):
+        return "excel"
+    if name.endswith("_report.pdf"):
+        return "pdf"
+    if name == "run_log.json":
+        return "run_log"
+    if name == "task_state.json":
+        return "agent_state"
+    if name == "history.json":
+        return "agent_history"
+    return "source_or_support"
+
+
+def _public_warnings_for_result(result: dict) -> list[str]:
+    """Convert internal report diagnostics into user-facing risk notes."""
+    quality = result.get("report_quality", {}) or {}
+    status = quality.get("status", "")
+    raw_warnings = quality.get("warnings", []) or []
+
+    public: list[str] = []
+    if result.get("evidence_status") == "fallback_success":
+        public.append("Agent 未完整产出证据链，本次已使用确定性证据工具兜底。")
+    if status == "degraded":
+        public.append("报告生成经过降级兜底，建议优先核对 analysis_evidence.md 中的数字来源。")
+    if status == "failed":
+        public.append("本次未能生成可信分析报告，请先修正输入数据后重试。")
+    for warning in raw_warnings:
+        if "LLM 报告编排异常" in warning:
+            public.append("模型报告编排异常，系统已保留证据文件供人工检查。")
+        elif "数据读取失败" in warning or "数据读取失败或为空" in warning:
+            public.append("数据读取失败或为空，不能生成正常交付物。")
+    return list(dict.fromkeys(public))
+
+
+def _next_steps_for_result(result: dict, recommended: list[dict]) -> list[str]:
+    if result.get("status") != "completed":
+        return [
+            "检查输入文件是否为空、编码是否正常、格式是否为 CSV/XLS/XLSX。",
+            "修正数据文件后重新运行 datahelp analyze。",
+            "如仍失败，查看 analysis_evidence.md 和 run_log.json 中的错误原因。",
+        ]
+    steps = ["先打开 analysis_report.md 阅读完整结论。"]
+    if any(f["role"] == "html" for f in recommended):
+        steps.append("需要展示时打开 HTML 报告。")
+    if any(f["role"] == "excel" for f in recommended):
+        steps.append("需要检查数据和统计过程时打开 Excel 文件。")
+    if result.get("evidence_status") == "fallback_success":
+        steps.append("本次使用了确定性证据兜底，建议重点查看证据文件确认数字来源。")
+    return steps
+
+
+def _write_result_summary(manifest: dict, task_dir: Path) -> Path:
+    """Write a beginner-facing Markdown summary next to run artifacts."""
+    lines = [
+        "# DataHelp 结果摘要",
+        "",
+        f"- 状态: {manifest['status']}",
+        f"- 输入文件: {manifest['input_file']}",
+        f"- 输出目录: {manifest['output_dir']}",
+        f"- Agent 路径: {manifest.get('agent_path') or '未记录'}",
+        f"- 证据状态: {manifest.get('evidence_status') or '未记录'}",
+        "",
+        "## 推荐先看",
+    ]
+    if manifest["recommended_files"]:
+        for f in manifest["recommended_files"]:
+            lines.append(f"- {f['name']} ({f['role']})")
+    else:
+        lines.append("- 暂无可推荐文件，请查看 run_log.json。")
+
+    if manifest["warnings"]:
+        lines.extend(["", "## 风险提示"])
+        for warning in manifest["warnings"]:
+            lines.append(f"- {warning}")
+
+    lines.extend(["", "## 下一步"])
+    for step in manifest["next_steps"]:
+        lines.append(f"- {step}")
+
+    lines.extend(["", "## 全部文件"])
+    for f in manifest["files"]:
+        status = "存在" if f["exists"] else "缺失"
+        lines.append(f"- {f['name']} | {f['role']} | {status} | {f['size_bytes']} bytes")
+
+    path = task_dir / "RESULT_SUMMARY.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def try_convert_excel_to_csv(excel_path: Path, output_dir: Path) -> Path | None:
@@ -204,86 +349,110 @@ def run_data_help_analysis(
 
         result["working_file"] = work_csv
 
-        # ── 确定性分析引擎：产生可审计证据文件 ──
-        engine_result = None
-        try:
-            from datahelp.analysis_engine import DeterministicAnalysisEngine
-
-            engine_result = DeterministicAnalysisEngine.run(work_csv, str(task_dir))
-            result["evidence_status"] = "success"
-            evidence_files = ["analysis_evidence.json", "analysis_evidence.md"]
-            result["evidence_files"] = evidence_files
-            result["evidence_error"] = ""
-
-            for fname in evidence_files:
-                fpath = task_dir / fname
-                if fpath.exists() and fname not in result["generated_files"]:
-                    result["generated_files"].append(fname)
-
-            print(f"  ✅ 证据文件已生成: {', '.join(evidence_files)}")
-        except Exception as e:
-            result["evidence_status"] = "failed"
-            result["evidence_files"] = []
-            result["evidence_error"] = str(e)
-            print(f"  ⚠️ 确定性分析引擎异常（不影响主流程）: {e}")
-
         # ── 加载环境变量 ──
         load_project_env(str(work_dir))
 
-        # ── 分支：确定性分析路径 vs 传统 agent 路径 ──
-        if result.get("evidence_status") == "success":
-            # 确定性分析 + 报告编排路径（无 agent）
-            from datahelp.report_orchestrator import ReportOrchestrator
+        # ── Agent-first 路径：模型负责决策，高层工具负责稳定执行 ──
+        from datahelp.cli import build_agent
 
-            try:
-                client = create_model_client(provider=provider, model=model)
-                outcome = ReportOrchestrator(client, engine_result, mode).run()
-                final_answer = outcome.text
-                result["report_quality"] = {
-                    "status": outcome.quality_status,
-                    "attempts": outcome.attempts,
-                    "warnings": outcome.warnings,
-                }
-                agent = None
-                _model_name = client.model_name
-            except Exception as e:
-                from datahelp.report_orchestrator import build_evidence_report
-                final_answer = build_evidence_report(engine_result)
-                result["report_quality"] = {
-                    "status": "degraded",
-                    "attempts": 0,
-                    "warnings": [f"LLM 报告编排异常: {e}"],
-                }
-                agent = None
-                _model_name = "degraded"
+        class _Args:
+            def __init__(self):
+                self.provider = provider
+                self.model = model
+                self.cwd = str(work_dir)
+                self.output_dir = str(task_dir)
+                self.max_steps = max_steps
+                self.max_new_tokens = max_new_tokens
+                self.approval = "auto"
+                self.temperature = None
+                self.mode = mode
+                self.eval = None  # eval 模式不需要在 pipeline 支持
+
+        args = _Args()
+        agent, run_store = build_agent(args)
+
+        user_message = (
+            f"请以产品级 Agent 工作流分析数据集 {Path(work_csv).name}。"
+            f"目标：为商科初学者生成可信、可学习、可交付的数据分析报告。"
+            f"请优先调用 inspect_dataset、suggest_analysis_plan、run_analysis_evidence、"
+            f"validate_evidence、compose_report_from_evidence。证据输出目录请使用当前工作目录 '.'。"
+        )
+        print(f"\n  📊 开始 Agent 分析: {Path(input_file).name}")
+        print(f"  📁 工作目录: {work_dir}")
+        print(f"  🤖 模型: {agent.model.model_name}\n")
+
+        final_answer = agent.ask(user_message)
+        _model_name = agent.model.model_name
+        result["agent_path"] = "agent_first"
+
+        evidence_json = task_dir / "analysis_evidence.json"
+        evidence_md = task_dir / "analysis_evidence.md"
+        if evidence_json.exists() and evidence_md.exists():
+            result["evidence_status"] = "success"
+            result["evidence_files"] = ["analysis_evidence.json", "analysis_evidence.md"]
+            result["evidence_error"] = ""
+            result["report_quality"] = {
+                "status": "agent_generated",
+                "attempts": getattr(agent.task_state, "attempts", 0) if agent.task_state else 0,
+                "warnings": [],
+            }
+            for fname in result["evidence_files"]:
+                if fname not in result["generated_files"]:
+                    result["generated_files"].append(fname)
         else:
-            # ── 传统 agent 路径（完全原有流程） ──
-            from datahelp.cli import build_agent
+            # Product fallback: preserve user value but mark that the Agent failed
+            # to complete the evidence loop by itself.
+            try:
+                from datahelp.analysis_engine import DeterministicAnalysisEngine
+                from datahelp.report_orchestrator import ReportOrchestrator, build_evidence_report
 
-            class _Args:
-                def __init__(self):
-                    self.provider = provider
-                    self.model = model
-                    self.cwd = str(work_dir)
-                    self.output_dir = str(task_dir)
-                    self.max_steps = max_steps
-                    self.max_new_tokens = max_new_tokens
-                    self.approval = "auto"
-                    self.temperature = None
-                    self.mode = mode
-                    self.eval = None  # eval 模式不需要在 pipeline 支持
-
-            args = _Args()
-            agent, run_store = build_agent(args)
-
-            # ── 执行分析 ──
-            user_message = f"分析数据集 {Path(work_csv).name}"
-            print(f"\n  📊 开始分析: {Path(input_file).name}")
-            print(f"  📁 工作目录: {work_dir}")
-            print(f"  🤖 模型: {agent.model.model_name}\n")
-
-            final_answer = agent.ask(user_message)
-            _model_name = agent.model.model_name
+                engine_result = DeterministicAnalysisEngine.run(work_csv, str(task_dir))
+                warnings = ["Agent 未产出证据文件，已使用确定性证据工具兜底。"]
+                if not _result_is_reportable(engine_result):
+                    final_answer = build_evidence_report(engine_result)
+                    quality_status = "failed"
+                    attempts = 0
+                    warnings.append("数据读取失败或为空，已停止正常报告生成。")
+                    _model_name = "failed"
+                    result["agent_path"] = "failed_evidence"
+                    result["evidence_status"] = "failed"
+                    result["evidence_error"] = "数据读取失败或为空，不能生成可信分析报告。"
+                else:
+                    try:
+                        client = create_model_client(provider=provider, model=model)
+                        outcome = ReportOrchestrator(client, engine_result, mode).run()
+                        final_answer = outcome.text
+                        quality_status = outcome.quality_status
+                        attempts = outcome.attempts
+                        warnings.extend(outcome.warnings)
+                        _model_name = client.model_name
+                    except Exception as e:
+                        final_answer = build_evidence_report(engine_result)
+                        quality_status = "degraded"
+                        attempts = 0
+                        warnings.append(f"LLM 报告编排异常: {e}")
+                        _model_name = "degraded"
+                    result["agent_path"] = "fallback_deterministic"
+                    result["evidence_status"] = "fallback_success"
+                    result["evidence_error"] = "Agent 未产出证据文件，已使用确定性证据工具兜底。"
+                result["evidence_files"] = ["analysis_evidence.json", "analysis_evidence.md"]
+                result["report_quality"] = {
+                    "status": quality_status,
+                    "attempts": attempts,
+                    "warnings": warnings,
+                }
+                for fname in result["evidence_files"]:
+                    if (task_dir / fname).exists() and fname not in result["generated_files"]:
+                        result["generated_files"].append(fname)
+            except Exception as e:
+                result["evidence_status"] = "failed"
+                result["evidence_files"] = []
+                result["evidence_error"] = str(e)
+                result["report_quality"] = {
+                    "status": "failed",
+                    "attempts": 0,
+                    "warnings": [str(e)],
+                }
 
         # ── 保存报告（共用 final_answer） ──
         report_path = task_dir / "analysis_report.md"
@@ -324,23 +493,24 @@ def run_data_help_analysis(
             result["generated_files"].append("history.json")
 
         # ── 生成交付物（Excel / HTML / PDF）──
-        try:
-            from datahelp.tools_data import generate_excel, generate_html, generate_pdf
-            csv_for_deliverable = work_csv if input_path.suffix.lower() != ".csv" else work_csv
-            if csv_for_deliverable and Path(csv_for_deliverable).exists():
-                excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
-                html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
-                pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
-                print(f"\n  {excel_result}")
-                print(f"  {html_result}")
-                print(f"  {pdf_result}")
-                result["generated_files"].extend([
-                    f"{input_path.stem}_analysis.xlsx",
-                    f"{input_path.stem}_report.html",
-                    f"{input_path.stem}_report.pdf",
-                ])
-        except Exception as e:
-            print(f"  ⚠️ 交付物生成失败: {e}")
+        if result.get("evidence_status") != "failed":
+            try:
+                from datahelp.tools_data import generate_excel, generate_html, generate_pdf
+                csv_for_deliverable = work_csv if input_path.suffix.lower() != ".csv" else work_csv
+                if csv_for_deliverable and Path(csv_for_deliverable).exists():
+                    excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                    html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                    pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                    print(f"\n  {excel_result}")
+                    print(f"  {html_result}")
+                    print(f"  {pdf_result}")
+                    result["generated_files"].extend([
+                        f"{input_path.stem}_analysis.xlsx",
+                        f"{input_path.stem}_report.html",
+                        f"{input_path.stem}_report.pdf",
+                    ])
+            except Exception as e:
+                print(f"  ⚠️ 交付物生成失败: {e}")
 
         # ── 收集 agent 在运行时生成的其他文件 ──
         for f in task_dir.iterdir():
@@ -354,7 +524,7 @@ def run_data_help_analysis(
             pass  # 保留在工作目录中
 
         # ── 更新结果 ──
-        result["status"] = "completed"
+        result["status"] = "failed" if result.get("evidence_status") == "failed" else "completed"
         result["end_time"] = now_iso()
         result["final_answer"] = final_answer
 
@@ -370,6 +540,18 @@ def run_data_help_analysis(
             encoding="utf-8",
         )
 
+    # ── 写入交付清单和用户摘要 ──
+    manifest = _build_result_manifest(result, task_dir)
+    manifest_path = task_dir / "result_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    summary_path = _write_result_summary(manifest, task_dir)
+    for fname in (manifest_path.name, summary_path.name):
+        if fname not in result["generated_files"]:
+            result["generated_files"].append(fname)
+
     # ── 写入 run_log.json ──
     duration = time.time() - started_at
     result["duration_seconds"] = round(duration, 2)
@@ -384,6 +566,9 @@ def run_data_help_analysis(
     print(f"\n  {status_icon} 分析完成: {result['status']}")
     print(f"  📁 输出目录: {task_dir}")
     print(f"  📄 生成文件: {', '.join(result['generated_files'])}")
+    if manifest["recommended_files"]:
+        rec_names = ", ".join(f["name"] for f in manifest["recommended_files"][:4])
+        print(f"  👀 推荐先看: {rec_names}")
     if result["error_message"]:
         print(f"  ⚠️ 错误: {result['error_message']}")
 

@@ -162,8 +162,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main():
     # ── Data Help Agent 子命令 ──────────────────────────
-    if len(sys.argv) > 1 and sys.argv[1] in ("setup", "watch", "config"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("setup", "watch", "config", "analyze"):
         subcommand = sys.argv[1]
+
+        if subcommand == "analyze":
+            parser = argparse.ArgumentParser(
+                prog="datahelp analyze",
+                description="一键分析 CSV/Excel，并生成报告、Excel、HTML、PDF 交付物",
+            )
+            parser.add_argument("input_file", help="要分析的 CSV / Excel 文件")
+            parser.add_argument("--output-dir", "-o", default="datahelp_outputs", help="输出文件夹")
+            parser.add_argument("--provider", "-p", default=provider_env("DATAHELP_PROVIDER", default="mock"), choices=["mock", "deepseek", "openai", "ollama", "anthropic"], help="模型提供商")
+            parser.add_argument("--model", "-m", default=None, help="模型名称")
+            parser.add_argument("--mode", default="beginner_summary", choices=["beginner_summary", "standard_report", "audit_report"], help="输出模式")
+            parser.add_argument("--max-steps", type=int, default=20, help="最大 Agent 工具步数")
+            parser.add_argument("--max-new-tokens", type=int, default=4096, help="每次模型调用的最大输出 token 数")
+            analyze_args = parser.parse_args(sys.argv[2:])
+
+            from datahelp.pipeline import run_data_help_analysis
+
+            result = run_data_help_analysis(
+                analyze_args.input_file,
+                analyze_args.output_dir,
+                provider=analyze_args.provider,
+                model=analyze_args.model,
+                mode=analyze_args.mode,
+                max_steps=analyze_args.max_steps,
+                max_new_tokens=analyze_args.max_new_tokens,
+            )
+            if result.get("status") == "completed":
+                print("\n  下一步：打开输出目录查看 analysis_report.md、HTML、Excel 或 PDF。")
+                return
+            print(f"\n  分析未完成：{result.get('error') or result.get('error_message') or result.get('evidence_error') or '未知错误'}")
+            sys.exit(1)
 
         if subcommand == "setup":
             from datahelp.config_manager import setup_interactive

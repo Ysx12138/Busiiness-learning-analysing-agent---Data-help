@@ -254,12 +254,44 @@ def tool_patch_file(args: dict, repo_root: str) -> str:
 
 
 def build_tool_registry(repo_root: str, depth: int = 0, max_depth: int = 1) -> dict:
+    from datahelp import agent_tools
+
     def _make(fn):
         def wrapped(args):
             return fn(args, repo_root)
         return wrapped
 
     tools = {
+        "inspect_dataset": _make_tool_spec(
+            schema={"path": "str"},
+            risky=False,
+            description="产品级数据集检查：读取 CSV/Excel，返回行列数、字段类型、缺失、样例值和下一步建议",
+            run_fn=_make(agent_tools.inspect_dataset),
+        ),
+        "suggest_analysis_plan": _make_tool_spec(
+            schema={"path": "str", "goal": "str="},
+            risky=False,
+            description="根据数据字段和用户目标生成小步可执行的分析计划",
+            run_fn=_make(agent_tools.suggest_analysis_plan),
+        ),
+        "run_analysis_evidence": _make_tool_spec(
+            schema={"path": "str", "output_dir": "str=."},
+            risky=False,
+            description="运行确定性分析证据工具，生成 analysis_evidence.json / .md，供 Agent 后续引用",
+            run_fn=_make(agent_tools.run_analysis_evidence),
+        ),
+        "validate_evidence": _make_tool_spec(
+            schema={"evidence_path": "str=analysis_evidence.json"},
+            risky=False,
+            description="检查分析证据是否存在、可解析、足以生成报告，并明确 degraded/failed 状态",
+            run_fn=_make(agent_tools.validate_evidence),
+        ),
+        "compose_report_from_evidence": _make_tool_spec(
+            schema={"evidence_path": "str=analysis_evidence.json", "mode": "str=beginner_summary"},
+            risky=False,
+            description="仅基于结构化证据生成教学报告，作为模型报告失败时的可靠兜底",
+            run_fn=_make(agent_tools.compose_report_from_evidence),
+        ),
         "list_files": _make_tool_spec(
             schema={"path": "str"},
             risky=False,

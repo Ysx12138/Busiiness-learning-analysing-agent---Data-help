@@ -22,13 +22,27 @@ pip install -e .
 cp .env.example .env
 # 编辑 .env，填入你的 API key
 
-# 5. 开始分析
-python -m datahelp --provider deepseek "分析数据集 sales.csv"
+# 5. 一键分析
+python -m datahelp analyze sales.csv -o outputs --provider deepseek
 ```
 
 ## 使用方式
 
-### One-shot 模式（单次分析）
+### 一键分析模式（推荐）
+
+```bash
+python -m datahelp analyze sales.csv -o outputs --provider deepseek
+```
+
+这个命令会自动创建任务输出目录，并生成：
+
+- `RESULT_SUMMARY.md`（推荐先看）
+- `result_manifest.json`
+- `analysis_report.md`
+- `analysis_evidence.json` / `analysis_evidence.md`
+- Excel / HTML / PDF 交付物
+
+### One-shot Agent 模式（高级）
 
 ```bash
 python -m datahelp --provider deepseek "列出项目根目录的文件"
@@ -41,7 +55,7 @@ python -m datahelp
 # 进入交互界面后直接输入问题
 ```
 
-### 数据分析
+### 自定义工作目录分析
 
 ```bash
 # 指定数据所在目录作为工作目录
@@ -79,22 +93,25 @@ python -m datahelp watch       # 监听输入文件夹，自动分析新文件
 --max-new-tokens   每次调用的最大输出 token 数
 ```
 
+更低门槛的一键入口：
+
+```
+python -m datahelp analyze <数据文件> -o <输出文件夹> --provider deepseek
+```
+
 ## 教学 Skill 模式
 
-在 `--mode beginner_summary` 模式下，数据分析报告按 12 节结构输出，缺一不可：
+在 `--mode beginner_summary` 模式下，数据分析报告按 9 个核心章节输出：
 
 1. **数据概览** — 数据集规模、字段说明、外键识别
-2. **字段识别与业务含义** — 每个字段的语义、字段-业务问题映射
-3. **数据质量检查** — 缺失值、重复值、异常值及教学说明
-4. **基础指标分析** — 均值/中位数/标准差/分位数
-5. **分组与排名分析** — Top/Bottom 排名及头部集中度
-6. **趋势分析** — 按月聚合、环比变化
-7. **核心发现** — 每个发现含结果/方法/指标/公式/字段/业务/风险/复用 8 要素
-8. **业务建议** — 数据驱动的具体行动建议
-9. **进阶分析推荐** — 为什么适合、需要什么字段、能回答什么
-10. **跳过的高级方法及原因** — 透明说明不执行的方法
-11. **分析边界与风险警告** — 局限性和风险提示
-12. **初学者教学总结** — 思维模型回顾、可复用分析思路
+2. **数据质量检查** — 缺失值、重复值、异常值及教学说明
+3. **基础指标分析** — 均值/中位数/标准差/分位数
+4. **分组与排名分析** — Top/Bottom 排名及头部集中度
+5. **趋势分析** — 按月聚合、环比变化；无法执行时说明原因
+6. **核心发现** — 每个发现含证据、方法、业务含义、风险和复用说明
+7. **业务建议** — 数据驱动的具体行动建议
+8. **分析边界与风险警告** — 局限性、跳过方法及风险提示
+9. **初学者教学总结** — 思维模型回顾、可复用分析思路
 
 ## 项目结构
 
@@ -105,6 +122,7 @@ datahelp/
 │   ├── runtime.py               # Agent 主循环
 │   ├── models.py                # LLM 模型客户端
 │   ├── tools.py                 # 工具注册表
+│   ├── agent_tools.py           # Agent 可调用的高层数据分析工具
 │   ├── tools_data.py            # 数据分析工具
 │   ├── context_manager.py       # Prompt 组装与预算控制
 │   ├── memory.py                # 分层记忆系统
@@ -130,19 +148,20 @@ datahelp/
 
 ## 运行原理
 
-DataHelp 是为数据分析重新设计的 Agent 架构，与传统的 Coding Agent tool-calling loop 不同：
+DataHelp 现在采用 **Agent-first + 确定性证据工具** 的架构。Agent 负责理解目标、决定下一步；高层数据工具负责稳定计算，避免模型编造数字：
 
 ```
-用户输入 → csv_summary（了解数据规模与字段）
-         → write_file(analysis_01.py) → run_shell（一次运行 9 个分析维度）
-         → 检查结果 → 迭代深挖（analysis_02.py、03.py...）
-         → 编译 12 节 <final> 报告
+用户输入 → inspect_dataset（了解数据规模、字段类型、样例值）
+         → suggest_analysis_plan（根据字段和目标制定小步计划）
+         → run_analysis_evidence（生成可追溯分析证据）
+         → validate_evidence（校验证据是否足以出报告）
+         → compose_report_from_evidence / <final>（生成 9 节教学报告）
          → generate_excel / generate_html / generate_pdf（交付物含分析结论）
 ```
 
 ### 为什么这样设计？
 
-传统 Coding Agent 的"一步调一个工具"适合线性调试，不适合分析类任务。数据分析需要先发散（多维度探索）再收敛（聚焦关键发现）。DataHelp 采用的**脚本工作流**让 Agent 一次写入完整的 pandas 分析脚本，一次性产出多个维度的分析结果，然后根据结果决定是否需要继续深挖。
+传统 Coding Agent 的"一步调一个工具"适合线性调试，不适合面向初学者的稳定数据分析。DataHelp 不再把核心成功路径完全押在模型自由写脚本上，而是把确定性分析能力封装成 Agent 可主动调用的高层工具。这样保留 Agent 的决策感，同时让数值证据更稳定、更可追溯。
 
 ### 关键参数
 
@@ -160,9 +179,9 @@ DataHelp 最初沿用 Coding Agent 的 tool-calling loop 架构，存在 6 项�
 | 问题 | 改前 | 改后 |
 |------|------|------|
 | SKILL.md 传递 | 800 字符手写提取（存活率 3%） | 28,790 字符全文注入（存活率 100%） |
-| 分析方式 | 一步调一个工具，看一个维度 | 一次写 pandas 脚本，看 9 个维度 |
-| 工作流 | field_types → missing_values → numeric_stats → ... | write_file → run_shell → 迭代深挖 → 编译报告 |
-| 输出结构 | 模型自由发挥 | 12 节强制结构 |
+| 分析方式 | 一步调一个工具，看一个维度 | Agent 选择高层分析工具，生成结构化证据 |
+| 工作流 | field_types → missing_values → numeric_stats → ... | inspect → plan → evidence → validate → report |
+| 输出结构 | 模型自由发挥 | 9 个核心章节 + 可选扩展模块 |
 | 交付物 | 纯模板，不含分析结论 | Excel/HTML/PDF 含 Agent 分析报告 |
 | ContextManager | 总预算 12K，前缀 3.6K（被截断） | 总预算 50K，前缀 32K（零截断） |
 

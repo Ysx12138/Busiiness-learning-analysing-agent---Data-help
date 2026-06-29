@@ -1,13 +1,12 @@
 """无网络单元测试：pipeline 集成报告编排与证据引擎。
 
 测试目标：
-  - 证据文件（analysis_evidence.json / .md）在 work_csv 就绪后被写入 task_dir
-  - result 中新增 evidence_status、evidence_files、evidence_error 字段
-  - generated_files 中追加证据文件
-  - 引擎成功 → ReportOrchestrator 路径，agent.ask 不被调用
-  - 引擎成功 → report_quality={status,attempts,warnings} 写入 result
-  - 引擎成功 → 编排文本被用于输出报告
-  - 引擎异常 → 传统 agent 路径，agent.ask 仍被调用
+  - Agent-first 路径会先调用 agent.ask
+  - Agent 未产出证据时，pipeline 明确标记 fallback_success
+  - 证据文件（analysis_evidence.json / .md）被写入 task_dir
+  - result 中包含 evidence_status、evidence_files、evidence_error、report_quality
+  - 输出目录包含 result_manifest.json 与 RESULT_SUMMARY.md
+  - 坏 CSV / 引擎异常不再被包装成 completed
 """
 from __future__ import annotations
 
@@ -111,9 +110,9 @@ class TestPipelineEvidenceSuccess(unittest.TestCase):
     # ── result 字段 ─────────────────────────────────────
 
     def test_evidence_status_success(self):
-        """evidence_status 为 'success'。"""
+        """mock Agent 未产出证据时，evidence_status 标记为 fallback_success。"""
         result = self._run()
-        self.assertEqual(result.get("evidence_status"), "success")
+        self.assertEqual(result.get("evidence_status"), "fallback_success")
 
     def test_evidence_files_list(self):
         """evidence_files 包含两个证据文件名。"""
@@ -129,14 +128,14 @@ class TestPipelineEvidenceSuccess(unittest.TestCase):
         self.assertIn("analysis_evidence.md", result["generated_files"])
 
     def test_evidence_error_empty_on_success(self):
-        """成功时 evidence_error 为空字符串。"""
+        """mock Agent 未产出证据时，pipeline 明确标记兜底原因。"""
         result = self._run()
-        self.assertEqual(result.get("evidence_error"), "")
+        self.assertIn("Agent 未产出证据文件", result.get("evidence_error", ""))
 
-    # ── agent 不被调用（ReportOrchestrator 路径） ────────
+    # ── Agent-first 路径 ────────
 
-    def test_agent_ask_not_called(self):
-        """证据引擎成功时 agent.ask 不被调用。"""
+    def test_agent_ask_called_first(self):
+        """Agent-first 路径会先调用 agent.ask，再在需要时兜底。"""
         from datahelp.report_orchestrator import ReportOutcome
         agent, run_store = _make_mock_agent()
         fake_outcome = ReportOutcome(
@@ -149,7 +148,7 @@ class TestPipelineEvidenceSuccess(unittest.TestCase):
             with patch("datahelp.report_orchestrator.ReportOrchestrator.run", return_value=fake_outcome):
                 from datahelp.pipeline import run_data_help_analysis
                 run_data_help_analysis(self.csv_path, self.output_dir, provider="mock")
-        agent.ask.assert_not_called()
+        agent.ask.assert_called_once()
 
     def test_pipeline_status_completed(self):
         """pipeline 最终状态为 completed。"""
@@ -170,7 +169,7 @@ class TestPipelineEvidenceSuccess(unittest.TestCase):
         self.assertIn("report_quality", result)
         self.assertEqual(result["report_quality"]["status"], "standard")
         self.assertEqual(result["report_quality"]["attempts"], 2)
-        self.assertEqual(result["report_quality"]["warnings"], [])
+        self.assertTrue(any("Agent 未产出证据文件" in w for w in result["report_quality"]["warnings"]))
 
     # ── 编排文本用于输出报告 ────────────────────────────
 
@@ -191,6 +190,21 @@ class TestPipelineEvidenceSuccess(unittest.TestCase):
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["row_count"], 12)
+
+    def test_result_manifest_and_summary_exist(self):
+        """输出目录包含面向用户的结果清单和摘要。"""
+        result = self._run()
+        manifest_path = os.path.join(result["output_dir"], "result_manifest.json")
+        summary_path = os.path.join(result["output_dir"], "RESULT_SUMMARY.md")
+        self.assertTrue(os.path.exists(manifest_path))
+        self.assertTrue(os.path.exists(summary_path))
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertTrue(any(f["role"] == "report" for f in manifest["recommended_files"]))
+        summary = Path(summary_path).read_text(encoding="utf-8")
+        self.assertIn("推荐先看", summary)
+        self.assertIn("analysis_report.md", summary)
 
 
 class TestPipelineEvidenceFailure(unittest.TestCase):
@@ -239,10 +253,10 @@ class TestPipelineEvidenceFailure(unittest.TestCase):
 
     # ── pipeline 不崩溃 ─────────────────────────────────
 
-    def test_pipeline_still_completed(self):
-        """引擎异常后 pipeline 状态仍为 completed。"""
+    def test_pipeline_marks_failed(self):
+        """引擎异常后 pipeline 不再伪装 completed。"""
         result = self._run_with_engine_error()
-        self.assertEqual(result.get("status"), "completed")
+        self.assertEqual(result.get("status"), "failed")
 
     def test_agent_ask_still_called(self):
         """引擎异常后 agent.ask 仍被调用。"""
@@ -324,13 +338,50 @@ class TestPipelineCreateModelClientError(unittest.TestCase):
         self.assertIn("数据分析报告（降级版）", content)
 
     def test_build_agent_not_called(self):
-        """datahelp.cli.build_agent 不被调用。"""
+        """Agent-first 路径会构建 agent；兜底阶段再处理报告编排异常。"""
         with patch("datahelp.pipeline.create_model_client") as mock_create:
             mock_create.side_effect = RuntimeError("模拟创建客户端失败")
-            with patch("datahelp.cli.build_agent") as mock_build:
+            agent, run_store = _make_mock_agent()
+            with patch("datahelp.cli.build_agent", return_value=(agent, run_store)) as mock_build:
                 from datahelp.pipeline import run_data_help_analysis
                 run_data_help_analysis(self.csv_path, self.output_dir, provider="mock")
-        mock_build.assert_not_called()
+        mock_build.assert_called_once()
+
+
+class TestPipelineBadCsvFailure(unittest.TestCase):
+    """坏 CSV 不应被包装成 completed。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.csv_path = os.path.join(self.tmpdir, "bad.csv")
+        with open(self.csv_path, "wb") as f:
+            f.write(b"\xff\xfe\x00\x00not,a,valid,utf8")
+        self.output_dir = os.path.join(self.tmpdir, "output")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_bad_csv_marks_pipeline_failed(self):
+        from datahelp.pipeline import run_data_help_analysis
+
+        result = run_data_help_analysis(self.csv_path, self.output_dir, provider="mock")
+
+        self.assertEqual(result.get("status"), "failed")
+        self.assertEqual(result.get("evidence_status"), "failed")
+        self.assertIn("不能生成可信分析报告", result.get("evidence_error", ""))
+        self.assertNotIn("bad_analysis.xlsx", result.get("generated_files", []))
+
+    def test_bad_csv_summary_contains_recovery_steps(self):
+        from datahelp.pipeline import run_data_help_analysis
+
+        result = run_data_help_analysis(self.csv_path, self.output_dir, provider="mock")
+        summary_path = os.path.join(result["output_dir"], "RESULT_SUMMARY.md")
+        content = Path(summary_path).read_text(encoding="utf-8")
+
+        self.assertIn("状态: failed", content)
+        self.assertIn("修正数据文件后重新运行", content)
 
 
 if __name__ == "__main__":
