@@ -1,5 +1,4 @@
 """文件监听器 —— 监听 input_dir，自动触发数据分析。
-from __future__ import annotations
 
 工作流程：
   1. 检查 input_dir 是否有新文件
@@ -10,6 +9,7 @@ from __future__ import annotations
 
 不修改任何现有 skill 输出逻辑。
 """
+from __future__ import annotations
 
 import hashlib
 import json
@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from datahelp.config_manager import load_config
-from datahelp.pipeline import run_data_help_analysis
+from datahelp.app import analyze as run_analysis
 
 
 def now_iso() -> str:
@@ -272,13 +272,17 @@ def start_watching(config: dict, single_run: bool = False) -> None:
 
                 # ── 触发分析 ──
                 try:
-                    result = run_data_help_analysis(
-                        input_file=abs_path,
+                    outcome = run_analysis(
+                        csv_path=abs_path,
                         output_dir=str(output_dir),
                         provider=provider,
                         model=model,
-                        mode=mode,
                     )
+                    result = {
+                        "status": outcome.status,
+                        "output_dir": outcome.output_dir,
+                        "generated_files": list(outcome.artifacts.values()),
+                    }
 
                     # ── 更新历史 ──
                     history[abs_path] = {

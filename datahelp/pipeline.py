@@ -40,6 +40,41 @@ def ensure_dir(path: str) -> Path:
     return p
 
 
+def _evidence_succeeded(engine_result) -> bool:
+    """判断确定性引擎是否真的产出了可用证据。
+
+    引擎在坏 CSV / 空表时不会抛异常，而是返回带 error / empty plan 的结果
+    （见 analysis_engine._make_failed_result / _make_empty_result）。
+    调用方必须显式判断，否则失败会被当成成功继续生成报告。
+    """
+    if engine_result is None:
+        return False
+    if not getattr(engine_result, "column_names", None):
+        return False
+    if getattr(engine_result, "row_count", 0) <= 0:
+        return False
+    return not any(getattr(p, "plan_id", "") in ("error", "empty") for p in engine_result.plans)
+
+
+def _evidence_failure_reason(engine_result) -> str:
+    """从引擎结果里取出失败原因，供日志与 run_log.json 记录。"""
+    if engine_result is None:
+        return "engine returned no result"
+    for plan in getattr(engine_result, "plans", []):
+        if getattr(plan, "plan_id", "") == "error":
+            for ev in getattr(plan, "evidence", []):
+                caveat = getattr(ev, "caveat", "") or getattr(ev, "value", "")
+                if caveat:
+                    return str(caveat)
+            return "engine reported an error plan"
+    if getattr(engine_result, "row_count", 0) <= 0:
+        return "数据集为空，无法分析"
+    if not getattr(engine_result, "column_names", None):
+        return "未能识别任何列"
+    return "引擎未产出可用证据"
+
+
+
 def try_convert_excel_to_csv(excel_path: Path, output_dir: Path) -> Path | None:
     """尝试将 Excel 文件转换为 CSV，使用可用的 Python 库。
 
@@ -161,32 +196,40 @@ def run_data_help_analysis(
     input_path = Path(input_file).resolve()
     output_root = ensure_dir(output_dir)
 
+    # 统一的返回骨架：任何提前退出都必须带上这些键，
+    # 否则调用方拿到的 dict 形状不一致（历史上早退分支只返回 status/error）。
+    result = {
+        "status": "running",
+        "input_file": str(input_path),
+        "output_dir": "",
+        "start_time": now_iso(),
+        "end_time": "",
+        "generated_files": [],
+        "error_message": "",
+        "final_answer": "",
+        "evidence_status": "",
+        "evidence_files": [],
+        "evidence_error": "",
+        "report_quality": {},
+    }
+
     if not input_path.exists():
-        return {"status": "failed", "error": f"文件不存在: {input_path}"}
+        return {**result, "status": "failed", "error_message": f"文件不存在: {input_path}"}
 
     # 检查文件格式
     supported = {".csv", ".xlsx", ".xls"}
     if input_path.suffix.lower() not in supported:
         return {
+            **result,
             "status": "failed",
-            "error": f"不支持的文件格式: {input_path.suffix}，支持: {', '.join(supported)}",
+            "error_message": f"不支持的文件格式: {input_path.suffix}，支持: {', '.join(supported)}",
         }
 
     # 创建任务输出目录
     task_dir_name = task_output_dir_name(input_path.name)
     task_dir = output_root / task_dir_name
     task_dir.mkdir(parents=True, exist_ok=True)
-
-    result = {
-        "status": "running",
-        "input_file": str(input_path),
-        "output_dir": str(task_dir),
-        "start_time": now_iso(),
-        "end_time": "",
-        "generated_files": [],
-        "error_message": "",
-        "final_answer": "",
-    }
+    result["output_dir"] = str(task_dir)
 
     try:
         # ── 预处理：处理数据文件 ──
@@ -210,17 +253,27 @@ def run_data_help_analysis(
             from datahelp.analysis_engine import DeterministicAnalysisEngine
 
             engine_result = DeterministicAnalysisEngine.run(work_csv, str(task_dir))
-            result["evidence_status"] = "success"
             evidence_files = ["analysis_evidence.json", "analysis_evidence.md"]
-            result["evidence_files"] = evidence_files
-            result["evidence_error"] = ""
+            if _evidence_succeeded(engine_result):
+                result["evidence_status"] = "success"
+                result["evidence_files"] = evidence_files
+                result["evidence_error"] = ""
+            else:
+                # 引擎对坏数据/空表不抛异常，而是返回带 error/empty plan 的结果。
+                # 以前这里无条件写 success，等于把失败伪装成成功。
+                result["evidence_status"] = "failed"
+                result["evidence_files"] = evidence_files
+                result["evidence_error"] = _evidence_failure_reason(engine_result)
 
             for fname in evidence_files:
                 fpath = task_dir / fname
                 if fpath.exists() and fname not in result["generated_files"]:
                     result["generated_files"].append(fname)
 
-            print(f"  ✅ 证据文件已生成: {', '.join(evidence_files)}")
+            if result["evidence_status"] == "success":
+                print(f"  ✅ 证据文件已生成: {', '.join(evidence_files)}")
+            else:
+                print(f"  ⚠️ 引擎未能产出可用证据: {result['evidence_error']}")
         except Exception as e:
             result["evidence_status"] = "failed"
             result["evidence_files"] = []
@@ -256,6 +309,16 @@ def run_data_help_analysis(
                 }
                 agent = None
                 _model_name = "degraded"
+        elif engine_result is not None and not getattr(engine_result, "column_names", None):
+            # 引擎跑完了但一个字段都没识别出来（编码错、空表、不是表格）。
+            # 这种情况下再交给 agent 也只会得到一份没有数据支撑的报告，
+            # 所以直接以失败收尾，而不是伪装成 "completed"。
+            # 注意：引擎自己崩溃（engine_result is None）不算这种情况，仍然回退到 agent。
+            final_answer = ""
+            agent = None
+            _model_name = "n/a"
+            result["status"] = "failed"
+            result["error_message"] = result.get("evidence_error") or "无法从输入文件解析出表格数据"
         else:
             # ── 传统 agent 路径（完全原有流程） ──
             from datahelp.cli import build_agent
@@ -286,8 +349,9 @@ def run_data_help_analysis(
             _model_name = agent.model.model_name
 
         # ── 保存报告（共用 final_answer） ──
-        report_path = task_dir / "analysis_report.md"
-        report_content = f"""# 数据分析报告
+        if result["status"] != "failed":
+            report_path = task_dir / "analysis_report.md"
+            report_content = f"""# 数据分析报告
 
 ## 基本信息
 
@@ -302,61 +366,62 @@ def run_data_help_analysis(
 
 {final_answer}
 """
-        report_path.write_text(report_content, encoding="utf-8")
-        result["generated_files"].append("analysis_report.md")
+            report_path.write_text(report_content, encoding="utf-8")
+            result["generated_files"].append("analysis_report.md")
 
-        # ── 保存 task_state（仅 agent 路径） ──
-        if agent is not None and agent.task_state:
-            ts_path = task_dir / "task_state.json"
-            ts_path.write_text(
-                json.dumps(agent.task_state.to_dict(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            result["generated_files"].append("task_state.json")
+            # ── 保存 task_state（仅 agent 路径） ──
+            if agent is not None and agent.task_state:
+                ts_path = task_dir / "task_state.json"
+                ts_path.write_text(
+                    json.dumps(agent.task_state.to_dict(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                result["generated_files"].append("task_state.json")
 
-        # ── 保存 history（仅 agent 路径） ──
-        if agent is not None:
-            history_path = task_dir / "history.json"
-            history_path.write_text(
-                json.dumps(agent.history, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            result["generated_files"].append("history.json")
+            # ── 保存 history（仅 agent 路径） ──
+            if agent is not None:
+                history_path = task_dir / "history.json"
+                history_path.write_text(
+                    json.dumps(agent.history, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                result["generated_files"].append("history.json")
 
-        # ── 生成交付物（Excel / HTML / PDF）──
-        try:
-            from datahelp.tools_data import generate_excel, generate_html, generate_pdf
-            csv_for_deliverable = work_csv if input_path.suffix.lower() != ".csv" else work_csv
-            if csv_for_deliverable and Path(csv_for_deliverable).exists():
-                excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
-                html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
-                pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
-                print(f"\n  {excel_result}")
-                print(f"  {html_result}")
-                print(f"  {pdf_result}")
-                result["generated_files"].extend([
-                    f"{input_path.stem}_analysis.xlsx",
-                    f"{input_path.stem}_report.html",
-                    f"{input_path.stem}_report.pdf",
-                ])
-        except Exception as e:
-            print(f"  ⚠️ 交付物生成失败: {e}")
+            # ── 生成交付物（Excel / HTML / PDF）──
+            try:
+                from datahelp.tools_data import generate_excel, generate_html, generate_pdf
+                csv_for_deliverable = work_csv
+                if csv_for_deliverable and Path(csv_for_deliverable).exists():
+                    excel_result = generate_excel(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                    html_result = generate_html(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                    pdf_result = generate_pdf(csv_for_deliverable, str(task_dir), str(task_dir), analysis_text=final_answer, mode=mode)
+                    print(f"\n  {excel_result}")
+                    print(f"  {html_result}")
+                    print(f"  {pdf_result}")
+                    result["generated_files"].extend([
+                        f"{input_path.stem}_analysis.xlsx",
+                        f"{input_path.stem}_report.html",
+                        f"{input_path.stem}_report.pdf",
+                    ])
+            except Exception as e:
+                print(f"  ⚠️ 交付物生成失败: {e}")
 
-        # ── 收集 agent 在运行时生成的其他文件 ──
-        for f in task_dir.iterdir():
-            if f.is_file() and f.name not in ("analysis_report.md", "task_state.json", "history.json", "run_log.json", "error_log.txt"):
-                if f.name not in result["generated_files"]:
-                    result["generated_files"].append(f.name)
+            # ── 收集 agent 在运行时生成的其他文件 ──
+            for f in task_dir.iterdir():
+                if f.is_file() and f.name not in ("analysis_report.md", "task_state.json", "history.json", "run_log.json", "error_log.txt"):
+                    if f.name not in result["generated_files"]:
+                        result["generated_files"].append(f.name)
+
+            # ── 更新结果 ──
+            result["status"] = "completed"
+            result["final_answer"] = final_answer
 
         # ── 清理临时工作文件 ──
         working_path = Path(work_csv)
         if working_path.exists() and working_path.parent == task_dir:
             pass  # 保留在工作目录中
 
-        # ── 更新结果 ──
-        result["status"] = "completed"
         result["end_time"] = now_iso()
-        result["final_answer"] = final_answer
 
     except Exception as e:
         result["status"] = "failed"
