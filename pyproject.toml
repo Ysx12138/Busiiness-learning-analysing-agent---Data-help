@@ -23,10 +23,11 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = [
-    "httpx>=0.28.0",
-    "pandas>=2.0.0",
-    "openpyxl>=3.1.0",
-    "fpdf2>=2.8.0",
+    "httpx>=0.28.0,<1",
+    "pandas>=2.0.0,<4",
+    "numpy>=1.24,<3",
+    "openpyxl>=3.1.0,<4",
+    "fpdf2>=2.8.0,<3",
 ]
 
 [project.urls]

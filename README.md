@@ -101,8 +101,12 @@ python -m datahelp watch       # 监听输入文件夹，自动分析新文件
 ```
 datahelp/
 ├── datahelp/                    # 核心 Python 包
+│   ├── app.py                   # 统一编排：profile → plan → compute → narrate → deliver
+│   ├── profile.py               # 数据集画像（只描述，不下结论）
+│   ├── plan.py                  # 分析计划与确定性计算
+│   ├── narrative.py             # 报告渲染与章节校验
 │   ├── cli.py                   # 命令行入口
-│   ├── runtime.py               # Agent 主循环
+│   ├── runtime.py               # 旧的 Agent 主循环（--agent 时使用）
 │   ├── models.py                # LLM 模型客户端
 │   ├── tools.py                 # 工具注册表
 │   ├── tools_data.py            # 数据分析工具
@@ -128,43 +132,43 @@ datahelp/
 └── LICENSE
 ```
 
-## 运行原理
+## 运行原理（V3）
 
-DataHelp 是为数据分析重新设计的 Agent 架构，与传统的 Coding Agent tool-calling loop 不同：
+一次分析固定走五步，每一步的产物都落盘，出问题能倒查：
 
 ```
-用户输入 → csv_summary（了解数据规模与字段）
-         → write_file(analysis_01.py) → run_shell（一次运行 9 个分析维度）
-         → 检查结果 → 迭代深挖（analysis_02.py、03.py...）
-         → 编译 12 节 <final> 报告
-         → generate_excel / generate_html / generate_pdf（交付物含分析结论）
+CSV
+ ├─① profile   只描述不判断：列类型、取值、缺失、疑似主键/日期/金额
+ │             → profile.json
+ ├─② plan      模型基于画像提出"要回答什么问题、算什么、为什么"
+ │             没有模型时用默认计划兜底
+ │             → plan.json
+ ├─③ compute   把计划编译成固定模板的 pandas 计算
+ │             数值只可能从这里产生，每条都带公式和来源列
+ │             → evidence.json
+ ├─④ narrate   模型只解释证据，不许自己算；结构按固定章节校验
+ │             没有模型时直接由证据渲染
+ │             → report.md
+ └─⑤ deliver   从证据和报告渲染 Excel / HTML / PDF
 ```
 
-### 为什么这样设计？
+核心约定：**模型决定算什么，代码负责算出来，模型只负责解释。**
 
-传统 Coding Agent 的"一步调一个工具"适合线性调试，不适合分析类任务。数据分析需要先发散（多维度探索）再收敛（聚焦关键发现）。DataHelp 采用的**脚本工作流**让 Agent 一次写入完整的 pandas 分析脚本，一次性产出多个维度的分析结果，然后根据结果决定是否需要继续深挖。
+### 和之前两版的区别
 
-### 关键参数
+| | V1（agent 循环） | V2（确定性引擎） | V3 |
+|---|---|---|---|
+| 分析什么 | 模型自由决定 | 写死 7 个计划 | 模型提计划，可审计 |
+| 数值来源 | 模型写的脚本 | pandas | pandas，公式随计划落档 |
+| 报告结构 | prompt 要求 | 标题正则校验 | 章节校验，单一来源 |
+| 入口 | one-shot / REPL | 仅 watch | 全部走同一条 |
 
-- 最大工具调用步数：40（应对多轮迭代分析）
-- 工具输出上限：12,000 字符（减少复杂分析脚本的输出截断）
-- 内置 SKILL.md 全文注入：28,790 字符教学规则 100% 传递给模型
-- ContextManager 预算：50,000 字符（前缀 32K / 记忆 5K / 历史 12K）
+`--agent` 参数仍可回退到 V1 的自由循环，用于探索性追问；`python -m datahelp` 的主路径已经切到 V3。
 
-## 架构演进
+### 为什么这样设计
 
-DataHelp 最初沿用 Coding Agent 的 tool-calling loop 架构，存在 6 项根本性问题：SKILL.md 手写提取丢失 97% 规则、工具粒度太细、步数限制、输出截断、预算不足、交付物脱节。详细的排查过程记录在 [AUDIT_V3.md](AUDIT_V3.md)。
-
-核心改造：
-
-| 问题 | 改前 | 改后 |
-|------|------|------|
-| SKILL.md 传递 | 800 字符手写提取（存活率 3%） | 28,790 字符全文注入（存活率 100%） |
-| 分析方式 | 一步调一个工具，看一个维度 | 一次写 pandas 脚本，看 9 个维度 |
-| 工作流 | field_types → missing_values → numeric_stats → ... | write_file → run_shell → 迭代深挖 → 编译报告 |
-| 输出结构 | 模型自由发挥 | 12 节强制结构 |
-| 交付物 | 纯模板，不含分析结论 | Excel/HTML/PDF 含 Agent 分析报告 |
-| ContextManager | 总预算 12K，前缀 3.6K（被截断） | 总预算 50K，前缀 32K（零截断） |
+V1 让模型自己写脚本算数，灵活但数字不可复现；V2 把"算什么"写死，可信但只会分析事先想到的那种表。
+V3 把两件事分开：**分析什么**交给模型（它擅长，且计划可审计），**算出什么**交给代码（可复现，可追溯）。
 
 ## 开发
 

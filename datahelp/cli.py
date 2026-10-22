@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -156,14 +157,65 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", default=None, choices=["beginner_summary", "standard_report", "audit_report"], help="输出模式（beginner_summary: 初学者友好, standard_report: 标准报告, audit_report: 审计报告）")
     parser.add_argument("--output-dir", "-o", default=None, help="交付产物输出文件夹（Excel/HTML/PDF）")
     parser.add_argument("--eval", default=None, help="评测模式：指定测试集 JSONL 文件路径")
+    parser.add_argument("--agent", action="store_true", help="强制使用旧的自由 agent 循环，而不是统一分析链路")
     parser.add_argument("task", nargs="?", default=None, help="一次性任务文本。不传则进入交互模式。")
     return parser.parse_args(argv)
 
 
+def _print_outcome(outcome) -> None:
+    icon = "✅" if outcome.status == "completed" else "❌"
+    print(f"\n  {icon} {outcome.status} | 耗时 {outcome.duration:.1f}s")
+    if outcome.error:
+        print(f"  ⚠️  {outcome.error}")
+    if outcome.report_issues:
+        print(f"  ⚠️  报告问题: {'、'.join(outcome.report_issues)}")
+    print(f"  📁 输出目录: {outcome.output_dir}")
+    for name, path in outcome.artifacts.items():
+        print(f"     {name}: {path}")
+
+
+def _run_analyze_command(argv: list[str]) -> None:
+    """datahelp analyze <数据文件> [--output-dir DIR] [--provider X] [--question Q]"""
+    parser = argparse.ArgumentParser(prog="datahelp analyze", description="分析一个数据文件")
+    parser.add_argument("file", help="CSV 或 Excel 文件")
+    parser.add_argument("-o", "--output-dir", default="datahelp_output", help="输出目录")
+    parser.add_argument("-p", "--provider", default=provider_env("DATAHELP_PROVIDER", default="mock"))
+    parser.add_argument("-m", "--model", default=None)
+    parser.add_argument("-q", "--question", default="", help="本次要回答的业务问题")
+    parser.add_argument("--no-model", action="store_true", help="不调模型，只用确定性计算出报告")
+    ns = parser.parse_args(argv)
+
+    from datahelp.app import analyze
+
+    outcome = analyze(
+        ns.file,
+        ns.output_dir,
+        provider=ns.provider,
+        model=ns.model,
+        question=ns.question,
+        allow_model=not ns.no_model,
+    )
+    _print_outcome(outcome)
+
+
+def _find_data_file(task: str, cwd: str | None) -> str | None:
+    """从一句话里找出真实存在的数据文件路径。"""
+    base = Path(cwd).resolve() if cwd else Path.cwd()
+    for match in re.finditer(r"[^\s'\"，。]+\.(?:csv|xlsx|xls)", task, re.IGNORECASE):
+        candidate = base / match.group()
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def main():
     # ── Data Help Agent 子命令 ──────────────────────────
-    if len(sys.argv) > 1 and sys.argv[1] in ("setup", "watch", "config"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("setup", "watch", "config", "analyze"):
         subcommand = sys.argv[1]
+
+        if subcommand == "analyze":
+            _run_analyze_command(sys.argv[2:])
+            return
 
         if subcommand == "setup":
             from datahelp.config_manager import setup_interactive
@@ -201,6 +253,28 @@ def main():
         evaluator.run_all()
         evaluator.report()
         return
+
+    # 一句话里带了真实存在的数据文件 → 走统一分析链路（确定性强、可追溯）。
+    # 想强制用旧的自由 agent 循环，加 --agent。
+    if args.task and not args.eval and not args.agent:
+        data_file = _find_data_file(args.task, args.cwd)
+        if data_file:
+            from datahelp.app import analyze
+
+            output_dir = args.output_dir or "datahelp_output"
+            print(f"\n  📊 分析: {data_file}")
+            print(f"  🤖 模型: {args.provider}")
+            print(f"  📁 输出: {output_dir}\n")
+            outcome = analyze(
+                data_file,
+                output_dir,
+                provider=args.provider,
+                model=args.model,
+                question=args.task,
+                allow_model=args.provider != "mock",
+            )
+            _print_outcome(outcome)
+            return
 
     agent, run_store = build_agent(args)
     if args.task:
